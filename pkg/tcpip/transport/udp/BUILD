@@ -62,6 +62,7 @@ go_test(
         "//pkg/tcpip/network/ipv6",
         "//pkg/tcpip/stack",
         "//pkg/tcpip/testutil",
+        "//pkg/tcpip/transport",
         "//pkg/tcpip/transport/icmp",
         "//pkg/tcpip/transport/testing/context",
         "//pkg/waiter",

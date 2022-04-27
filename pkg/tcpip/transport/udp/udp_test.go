@@ -37,6 +37,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/testutil"
+	"gvisor.dev/gvisor/pkg/tcpip/transport"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/testing/context"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
@@ -419,11 +420,20 @@ func TestV4ReadBroadcastOnBoundToWildcard(t *testing.T) {
 	}
 }
 
+func getEndpointWithPreflight(c *context.Context) tcpip.EndpointWithPreflight {
+	epWithPreflight, ok := c.EP.(tcpip.EndpointWithPreflight)
+
+	if !ok {
+		c.T.Fatalf("Expect UDP endpoints implement tcpip.EndpointWithPreflight")
+	}
+	return epWithPreflight
+}
+
 // testFailingWrite sends a packet of the given test flow into the UDP endpoint
 // and verifies it fails with the provided error code.
 // TODO(https://gvisor.dev/issue/5623): Extract the test write methods in the
 // testing context.
-func testFailingWrite(c *context.Context, flow context.TestFlow, payloadSize int, wantErr tcpip.Error) {
+func testFailingWrite(c *context.Context, flow context.TestFlow, payloadSize int, wantErrWrite tcpip.Error, wantErrPreflight tcpip.Error) {
 	c.T.Helper()
 	// Take a snapshot of the stats to validate them at the end of the test.
 	var epstats tcpip.TransportEndpointStats
@@ -431,14 +441,22 @@ func testFailingWrite(c *context.Context, flow context.TestFlow, payloadSize int
 	h := flow.MakeHeader4Tuple(context.Outgoing)
 	writeDstAddr := flow.MapAddrIfApplicable(h.Dst.Addr)
 
+	writeOpts := tcpip.WriteOptions{
+		To: &tcpip.FullAddress{Addr: writeDstAddr, Port: h.Dst.Port},
+	}
+
+	gotErr := getEndpointWithPreflight(c).Preflight(writeOpts)
+	c.CheckEndpointWriteStats(0, &epstats, gotErr)
+	if gotErr != wantErrPreflight {
+		c.T.Fatalf("Preflight returned unexpected error: got %v, want %v", gotErr, wantErrPreflight)
+	}
+
 	var r bytes.Reader
 	r.Reset(newRandomPayload(payloadSize))
-	_, gotErr := c.EP.Write(&r, tcpip.WriteOptions{
-		To: &tcpip.FullAddress{Addr: writeDstAddr, Port: h.Dst.Port},
-	})
+	_, gotErr = c.EP.Write(&r, writeOpts)
 	c.CheckEndpointWriteStats(1, &epstats, gotErr)
-	if gotErr != wantErr {
-		c.T.Fatalf("Write returned unexpected error: got %v, want %v", gotErr, wantErr)
+	if gotErr != wantErrWrite {
+		c.T.Fatalf("Write returned unexpected error: got %v, want %v", gotErr, wantErrWrite)
 	}
 }
 
@@ -480,6 +498,10 @@ func testWriteNoVerify(c *context.Context, flow context.TestFlow, setDest bool) 
 			To: &tcpip.FullAddress{Addr: writeDstAddr, Port: h.Dst.Port},
 		}
 	}
+	if err := getEndpointWithPreflight(c).Preflight(writeOpts); err != nil {
+		c.T.Fatalf("Preflight failed: %s", err)
+	}
+
 	var r bytes.Reader
 	payload := newRandomPayload(arbitraryPayloadSize)
 	r.Reset(payload)
@@ -592,7 +614,7 @@ func TestDualWriteConnectedToV6(t *testing.T) {
 	testWrite(c, context.UnicastV6)
 
 	// Write to V4 mapped address.
-	testFailingWrite(c, context.UnicastV4in6, arbitraryPayloadSize, &tcpip.ErrNetworkUnreachable{})
+	testFailingWrite(c, context.UnicastV4in6, arbitraryPayloadSize, &tcpip.ErrNetworkUnreachable{}, &tcpip.ErrNetworkUnreachable{})
 	const want = 1
 	if got := c.EP.Stats().(*tcpip.TransportEndpointStats).SendErrors.NoRoute.Value(); got != want {
 		c.T.Fatalf("Endpoint stat not updated. got %d want %d", got, want)
@@ -613,7 +635,31 @@ func TestDualWriteConnectedToV4Mapped(t *testing.T) {
 	testWrite(c, context.UnicastV4in6)
 
 	// Write to v6 address.
-	testFailingWrite(c, context.UnicastV6, arbitraryPayloadSize, &tcpip.ErrInvalidEndpointState{})
+	testFailingWrite(c, context.UnicastV6, arbitraryPayloadSize, &tcpip.ErrInvalidEndpointState{}, &tcpip.ErrInvalidEndpointState{})
+}
+
+func TestPreflightBindsEndpoint(t *testing.T) {
+	for _, ipProtocolNumber := range []tcpip.NetworkProtocolNumber{ipv6.ProtocolNumber, ipv4.ProtocolNumber} {
+		c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol})
+		defer c.Cleanup()
+
+		c.CreateEndpoint(ipProtocolNumber, udp.ProtocolNumber)
+
+		flow := context.UnicastV6
+		h := flow.MakeHeader4Tuple(context.Outgoing)
+		writeDstAddr := flow.MapAddrIfApplicable(h.Dst.Addr)
+		writeOpts := tcpip.WriteOptions{
+			To: &tcpip.FullAddress{Addr: writeDstAddr, Port: h.Dst.Port},
+		}
+
+		if err := getEndpointWithPreflight(c).Preflight(writeOpts); err != nil {
+			c.T.Fatalf("Preflight failed: %s", err)
+		}
+
+		if c.EP.State() != uint32(transport.DatagramEndpointStateBound) {
+			c.T.Fatalf("Expect UDP endpoint in state %d, found %d", transport.DatagramEndpointStateBound, c.EP.State())
+		}
+	}
 }
 
 func TestV4WriteOnV6Only(t *testing.T) {
@@ -623,7 +669,7 @@ func TestV4WriteOnV6Only(t *testing.T) {
 	c.CreateEndpointForFlow(context.UnicastV6Only, udp.ProtocolNumber)
 
 	// Write to V4 mapped address.
-	testFailingWrite(c, context.UnicastV4in6, arbitraryPayloadSize, &tcpip.ErrNoRoute{})
+	testFailingWrite(c, context.UnicastV4in6, arbitraryPayloadSize, &tcpip.ErrNoRoute{}, &tcpip.ErrNoRoute{})
 }
 
 func TestV6WriteOnBoundToV4Mapped(t *testing.T) {
@@ -638,7 +684,7 @@ func TestV6WriteOnBoundToV4Mapped(t *testing.T) {
 	}
 
 	// Write to v6 address.
-	testFailingWrite(c, context.UnicastV6, arbitraryPayloadSize, &tcpip.ErrInvalidEndpointState{})
+	testFailingWrite(c, context.UnicastV6, arbitraryPayloadSize, &tcpip.ErrInvalidEndpointState{}, &tcpip.ErrInvalidEndpointState{})
 }
 
 func TestV6WriteOnConnected(t *testing.T) {
@@ -1774,7 +1820,7 @@ func TestShutdownWrite(t *testing.T) {
 		t.Fatalf("Shutdown failed: %s", err)
 	}
 
-	testFailingWrite(c, context.UnicastV6, arbitraryPayloadSize, &tcpip.ErrClosedForSend{})
+	testFailingWrite(c, context.UnicastV6, arbitraryPayloadSize, &tcpip.ErrClosedForSend{}, &tcpip.ErrClosedForSend{})
 }
 
 func TestOutgoingSubnetBroadcast(t *testing.T) {
@@ -2082,7 +2128,7 @@ func TestWritePayloadSizeTooBig(t *testing.T) {
 	}
 
 	testWrite(c, context.UnicastV6)
-	testFailingWrite(c, context.UnicastV6, header.UDPMaximumPacketSize+1, &tcpip.ErrMessageTooLong{})
+	testFailingWrite(c, context.UnicastV6, header.UDPMaximumPacketSize+1, &tcpip.ErrMessageTooLong{}, nil)
 }
 
 func TestMain(m *testing.M) {
