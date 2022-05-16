@@ -84,6 +84,21 @@ func (mm *MemoryManager) checkIOVec(ars hostarch.AddrRangeSeq) bool {
 	return true
 }
 
+// InitializePMAs attempts to initialize PMAs for the given addr with the
+// requested length. It returns the length which it was able to initialize the
+// address range with; if this length is smaller than the requested length it
+// returns an error explaining why.
+func (mm *MemoryManager) InitializePMAs(ctx context.Context, addr hostarch.Addr, length int64, opts usermem.IOOpts) (int64, error) {
+	ar, ok := mm.CheckIORange(addr, length)
+	if !ok {
+		return 0, linuxerr.EFAULT
+	}
+	n64, err := mm.withInternalMappings(ctx, ar, hostarch.Write, opts.IgnorePermissions, func(ims safemem.BlockSeq) (uint64, error) {
+		return uint64(ims.Len()), nil
+	})
+	return int64(n64), err
+}
+
 func (mm *MemoryManager) asioEnabled(opts usermem.IOOpts) bool {
 	return mm.haveASIO && !opts.IgnorePermissions && opts.AddressSpaceActive
 }
