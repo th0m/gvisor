@@ -1,4 +1,4 @@
-// Copyright 2021 The gVisor Authors.
+// Copyright 2022 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,9 +14,14 @@
 
 package buffer
 
-import "unsafe"
+// saveBuf is invoked by stateify.
+func (b *Buffer) saveData() []byte {
+	return b.Flatten()
+}
 
-const (
-	vectorisedViewStructSize = int(unsafe.Sizeof(VectorisedView{}))
-	viewStructSize           = int(unsafe.Sizeof(View{}))
-)
+// loadBuf is invoked by stateify.
+func (b *Buffer) loadData(data []byte) {
+	v := NewView(len(data))
+	v.Write(data)
+	b.Append(v)
+}
