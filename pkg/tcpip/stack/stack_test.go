@@ -258,7 +258,7 @@ func (f *fakeNetworkProtocol) NewEndpoint(nic stack.NetworkInterface, dispatcher
 		proto:      f,
 		dispatcher: dispatcher,
 	}
-	e.AddressableEndpointState.Init(e)
+	e.AddressableEndpointState.Init(e, stack.AddressableEndpointStateOptions{HiddenWhileDisabled: false})
 	return e
 }
 

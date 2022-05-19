@@ -196,7 +196,7 @@ func (f *fwdTestNetworkProtocol) NewEndpoint(nic NetworkInterface, dispatcher Tr
 		proto:      f,
 		dispatcher: dispatcher,
 	}
-	e.AddressableEndpointState.Init(e)
+	e.AddressableEndpointState.Init(e, AddressableEndpointStateOptions{HiddenWhileDisabled: false})
 	return e
 }
 

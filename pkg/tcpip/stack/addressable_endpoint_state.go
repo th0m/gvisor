@@ -26,6 +26,7 @@ var _ AddressableEndpoint = (*AddressableEndpointState)(nil)
 // AddressableEndpointState is an implementation of an AddressableEndpoint.
 type AddressableEndpointState struct {
 	networkEndpoint NetworkEndpoint
+	options         AddressableEndpointStateOptions
 
 	// Lock ordering (from outer to inner lock ordering):
 	//
@@ -39,11 +40,20 @@ type AddressableEndpointState struct {
 	}
 }
 
+// AddressableEndpointStateOptions contains options used to configure an
+// AddressableEndpointState.
+type AddressableEndpointStateOptions struct {
+	// HiddenWhileDisabled determines whether addresses of kind PermanentDisabled
+	// should be returned to callers.
+	HiddenWhileDisabled bool
+}
+
 // Init initializes the AddressableEndpointState with networkEndpoint.
 //
 // Must be called before calling any other function on m.
-func (a *AddressableEndpointState) Init(networkEndpoint NetworkEndpoint) {
+func (a *AddressableEndpointState) Init(networkEndpoint NetworkEndpoint, options AddressableEndpointStateOptions) {
 	a.networkEndpoint = networkEndpoint
+	a.options = options
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -120,7 +130,7 @@ func (a *AddressableEndpointState) releaseAddressStateLocked(addrState *addressS
 func (a *AddressableEndpointState) AddAndAcquirePermanentAddress(addr tcpip.AddressWithPrefix, properties AddressProperties) (AddressEndpoint, tcpip.Error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	ep, err := a.addAndAcquireAddressLocked(addr, properties, true /* permanent */)
+	ep, err := a.addAndAcquireAddressLocked(addr, properties, Permanent)
 	// From https://golang.org/doc/faq#nil_error:
 	//
 	// Under the covers, interfaces are implemented as two elements, a type T and
@@ -149,7 +159,34 @@ func (a *AddressableEndpointState) AddAndAcquirePermanentAddress(addr tcpip.Addr
 func (a *AddressableEndpointState) AddAndAcquireTemporaryAddress(addr tcpip.AddressWithPrefix, peb PrimaryEndpointBehavior) (AddressEndpoint, tcpip.Error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	ep, err := a.addAndAcquireAddressLocked(addr, AddressProperties{PEB: peb}, false /* permanent */)
+	ep, err := a.addAndAcquireAddressLocked(addr, AddressProperties{PEB: peb}, Temporary)
+	// From https://golang.org/doc/faq#nil_error:
+	//
+	// Under the covers, interfaces are implemented as two elements, a type T and
+	// a value V.
+	//
+	// An interface value is nil only if the V and T are both unset, (T=nil, V is
+	// not set), In particular, a nil interface will always hold a nil type. If we
+	// store a nil pointer of type *int inside an interface value, the inner type
+	// will be *int regardless of the value of the pointer: (T=*int, V=nil). Such
+	// an interface value will therefore be non-nil even when the pointer value V
+	// inside is nil.
+	//
+	// Since addAndAcquireAddressLocked returns a nil value with a non-nil type,
+	// we need to explicitly return nil below if ep is (a typed) nil.
+	if ep == nil {
+		return nil, err
+	}
+	return ep, err
+}
+
+// AddAndAcquireAddress adds an address with the specified kind.
+//
+// Returns *tcpip.ErrDuplicateAddress if the address exists.
+func (a *AddressableEndpointState) AddAndAcquireAddress(addr tcpip.AddressWithPrefix, properties AddressProperties, kind AddressKind) (AddressEndpoint, tcpip.Error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ep, err := a.addAndAcquireAddressLocked(addr, properties, kind)
 	// From https://golang.org/doc/faq#nil_error:
 	//
 	// Under the covers, interfaces are implemented as two elements, a type T and
@@ -180,7 +217,17 @@ func (a *AddressableEndpointState) AddAndAcquireTemporaryAddress(addr tcpip.Addr
 // returned, regardless the kind of address that is being added.
 //
 // Precondition: a.mu must be write locked.
-func (a *AddressableEndpointState) addAndAcquireAddressLocked(addr tcpip.AddressWithPrefix, properties AddressProperties, permanent bool) (*addressState, tcpip.Error) {
+func (a *AddressableEndpointState) addAndAcquireAddressLocked(addr tcpip.AddressWithPrefix, properties AddressProperties, kind AddressKind) (*addressState, tcpip.Error) {
+	var permanent bool
+	switch kind {
+	case PermanentExpired:
+		panic(fmt.Sprintf("cannot add address %s in PermanentExpired state", addr))
+	case Permanent, PermanentTentative, PermanentDisabled:
+		permanent = true
+	case Temporary:
+	default:
+		panic(fmt.Sprintf("unknown address kind: %d", kind))
+	}
 	// attemptAddToPrimary is false when the address is already in the primary
 	// address list.
 	attemptAddToPrimary := true
@@ -243,6 +290,7 @@ func (a *AddressableEndpointState) addAndAcquireAddressLocked(addr tcpip.Address
 		// We never promote an address to temporary - it can only be added as such.
 		// If we are actaully adding a permanent address, it is promoted below.
 		addrState.mu.kind = Temporary
+		addrState.mu.disp = properties.Disp
 	}
 
 	// At this point we have an address we are either promoting from an expired or
@@ -259,12 +307,24 @@ func (a *AddressableEndpointState) addAndAcquireAddressLocked(addr tcpip.Address
 
 		// Primary addresses are biased by 1.
 		addrState.mu.refs++
-		addrState.mu.kind = Permanent
+		addrState.mu.kind = kind
 	}
 	// Acquire the address before returning it.
 	addrState.mu.refs++
 	addrState.mu.deprecated = properties.Deprecated
 	addrState.mu.configType = properties.ConfigType
+	if !addrState.mu.deprecated {
+		if properties.PreferredUntil == (tcpip.MonotonicTime{}) {
+			addrState.mu.preferredUntil = tcpip.MonotonicTimeInfinite()
+		} else {
+			addrState.mu.preferredUntil = properties.PreferredUntil
+		}
+	}
+	if properties.ValidUntil == (tcpip.MonotonicTime{}) {
+		addrState.mu.validUntil = tcpip.MonotonicTimeInfinite()
+	} else {
+		addrState.mu.validUntil = properties.ValidUntil
+	}
 
 	if attemptAddToPrimary {
 		switch properties.PEB {
@@ -290,6 +350,7 @@ func (a *AddressableEndpointState) addAndAcquireAddressLocked(addr tcpip.Address
 		}
 	}
 
+	addrState.notifyChangedLocked()
 	return addrState, nil
 }
 
@@ -310,12 +371,12 @@ func (a *AddressableEndpointState) removePermanentAddressLocked(addr tcpip.Addre
 		return &tcpip.ErrBadLocalAddress{}
 	}
 
-	return a.removePermanentEndpointLocked(addrState)
+	return a.removePermanentEndpointLocked(addrState, AddressRemovalUserRemoved)
 }
 
 // RemovePermanentEndpoint removes the passed endpoint if it is associated with
 // a and permanent.
-func (a *AddressableEndpointState) RemovePermanentEndpoint(ep AddressEndpoint) tcpip.Error {
+func (a *AddressableEndpointState) RemovePermanentEndpoint(ep AddressEndpoint, reason AddressRemovalReason) tcpip.Error {
 	addrState, ok := ep.(*addressState)
 	if !ok || addrState.addressableEndpointState != a {
 		return &tcpip.ErrInvalidEndpointState{}
@@ -323,19 +384,19 @@ func (a *AddressableEndpointState) RemovePermanentEndpoint(ep AddressEndpoint) t
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.removePermanentEndpointLocked(addrState)
+	return a.removePermanentEndpointLocked(addrState, reason)
 }
 
 // removePermanentAddressLocked is like RemovePermanentAddress but with locking
 // requirements.
 //
 // Precondition: a.mu must be write locked.
-func (a *AddressableEndpointState) removePermanentEndpointLocked(addrState *addressState) tcpip.Error {
+func (a *AddressableEndpointState) removePermanentEndpointLocked(addrState *addressState, reason AddressRemovalReason) tcpip.Error {
 	if !addrState.GetKind().IsPermanent() {
 		return &tcpip.ErrBadLocalAddress{}
 	}
 
-	addrState.SetKind(PermanentExpired)
+	addrState.remove(reason)
 	a.decAddressRefLocked(addrState)
 	return nil
 }
@@ -376,8 +437,8 @@ func (a *AddressableEndpointState) decAddressRefLocked(addrState *addressState) 
 
 // SetDeprecated implements stack.AddressableEndpoint.
 func (a *AddressableEndpointState) SetDeprecated(addr tcpip.Address, deprecated bool) tcpip.Error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 
 	addrState, ok := a.mu.endpoints[addr]
 	if !ok {
@@ -387,13 +448,35 @@ func (a *AddressableEndpointState) SetDeprecated(addr tcpip.Address, deprecated 
 	return nil
 }
 
+// SetLifetimes implements stack.AddressableEndpoint.
+func (a *AddressableEndpointState) SetLifetimes(addr tcpip.Address, lifetimes AddressLifetimes) tcpip.Error {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	addrState, ok := a.mu.endpoints[addr]
+	if !ok {
+		return &tcpip.ErrBadLocalAddress{}
+	}
+	addrState.SetLifetimes(lifetimes)
+	return nil
+}
+
 // MainAddress implements AddressableEndpoint.
 func (a *AddressableEndpointState) MainAddress() tcpip.AddressWithPrefix {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
 	ep := a.acquirePrimaryAddressRLocked(func(ep *addressState) bool {
-		return ep.GetKind() == Permanent
+		switch kind := ep.GetKind(); kind {
+		case Permanent:
+			return true
+		case PermanentDisabled:
+			return !a.options.HiddenWhileDisabled
+		case PermanentTentative, PermanentExpired, Temporary:
+			return false
+		default:
+			panic(fmt.Sprintf("unknown address kind: %d", kind))
+		}
 	})
 	if ep == nil {
 		return tcpip.AddressWithPrefix{}
@@ -503,7 +586,7 @@ func (a *AddressableEndpointState) AcquireAssignedAddressOrMatching(localAddr tc
 
 	// Proceed to add a new temporary endpoint.
 	addr := localAddr.WithPrefix()
-	ep, err := a.addAndAcquireAddressLocked(addr, AddressProperties{PEB: tempPEB}, false /* permanent */)
+	ep, err := a.addAndAcquireAddressLocked(addr, AddressProperties{PEB: tempPEB}, Temporary)
 	if err != nil {
 		// addAndAcquireAddressLocked only returns an error if the address is
 		// already assigned but we just checked above if the address exists so we
@@ -573,12 +656,19 @@ func (a *AddressableEndpointState) PrimaryAddresses() []tcpip.AddressWithPrefix 
 
 	var addrs []tcpip.AddressWithPrefix
 	for _, ep := range a.mu.primary {
+		switch kind := ep.GetKind(); kind {
 		// Don't include tentative, expired or temporary endpoints
 		// to avoid confusion and prevent the caller from using
 		// those.
-		switch ep.GetKind() {
 		case PermanentTentative, PermanentExpired, Temporary:
 			continue
+		case PermanentDisabled:
+			if a.options.HiddenWhileDisabled {
+				continue
+			}
+		case Permanent:
+		default:
+			panic(fmt.Sprintf("address %s has unknown kind %d", ep.AddressWithPrefix(), kind))
 		}
 
 		addrs = append(addrs, ep.AddressWithPrefix())
@@ -612,7 +702,7 @@ func (a *AddressableEndpointState) Cleanup() {
 	for _, ep := range a.mu.endpoints {
 		// removePermanentEndpointLocked returns *tcpip.ErrBadLocalAddress if ep is
 		// not a permanent address.
-		switch err := a.removePermanentEndpointLocked(ep); err.(type) {
+		switch err := a.removePermanentEndpointLocked(ep, AddressRemovalInterfaceRemoved); err.(type) {
 		case nil, *tcpip.ErrBadLocalAddress:
 		default:
 			panic(fmt.Sprintf("unexpected error from removePermanentEndpointLocked(%s): %s", ep.addr, err))
@@ -639,6 +729,11 @@ type addressState struct {
 		kind       AddressKind
 		configType AddressConfigType
 		deprecated bool
+		// preferredUntil holds the zero value iff deprecated is true.
+		preferredUntil, validUntil tcpip.MonotonicTime
+		// The enclosing mutex must be write-locked before calling methods on the
+		// dispatcher.
+		disp AddressDispatcher
 	}
 }
 
@@ -663,22 +758,46 @@ func (a *addressState) GetKind() AddressKind {
 func (a *addressState) SetKind(kind AddressKind) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	var changed bool
+	if a.mu.kind != kind {
+		changed = true
+	}
 	a.mu.kind = kind
+	if kind == PermanentExpired {
+		a.notifyRemovedLocked(AddressRemovalUserRemoved)
+	} else if changed {
+		a.notifyChangedLocked()
+	}
+}
+
+// notifyRemovedLocked notifies integrators of address removal.
+func (a *addressState) notifyRemovedLocked(reason AddressRemovalReason) {
+	if disp := a.mu.disp; disp != nil {
+		a.mu.disp.OnRemoved(reason)
+		a.mu.disp = nil
+	}
+}
+
+func (a *addressState) remove(reason AddressRemovalReason) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.mu.kind = PermanentExpired
+	a.notifyRemovedLocked(reason)
 }
 
 // IsAssigned implements AddressEndpoint.
 func (a *addressState) IsAssigned(allowExpired bool) bool {
-	if !a.addressableEndpointState.networkEndpoint.Enabled() {
-		return false
-	}
-
-	switch a.GetKind() {
-	case PermanentTentative:
+	switch kind := a.GetKind(); kind {
+	case PermanentTentative, PermanentDisabled:
 		return false
 	case PermanentExpired:
 		return allowExpired
-	default:
+	case Permanent, Temporary:
 		return true
+	default:
+		panic(fmt.Sprintf("address %s has unknown kind %d", a.AddressWithPrefix(), kind))
 	}
 }
 
@@ -706,11 +825,49 @@ func (a *addressState) ConfigType() AddressConfigType {
 	return a.mu.configType
 }
 
+// notifyChangedLocked notifies integrators of address property changes.
+func (a *addressState) notifyChangedLocked() {
+	if disp := a.mu.disp; disp != nil {
+		var state AddressAssignmentState
+		switch a.mu.kind {
+		case Permanent:
+			state = AddressAssigned
+		case PermanentTentative:
+			state = AddressTentative
+		case PermanentDisabled:
+			state = AddressDisabled
+		case Temporary, PermanentExpired:
+			return
+		default:
+			panic(fmt.Sprintf("unrecognized address kind = %d", a.mu.kind))
+		}
+
+		disp.OnChanged(AddressLifetimes{
+			Deprecated:     a.mu.deprecated,
+			PreferredUntil: a.mu.preferredUntil,
+			ValidUntil:     a.mu.validUntil,
+		}, state,
+		)
+	}
+}
+
 // SetDeprecated implements AddressEndpoint.
 func (a *addressState) SetDeprecated(d bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.mu.deprecated = d
+
+	var changed bool
+	if a.mu.deprecated != d {
+		a.mu.deprecated = d
+		changed = true
+	}
+	if d && a.mu.preferredUntil != (tcpip.MonotonicTime{}) {
+		a.mu.preferredUntil = tcpip.MonotonicTime{}
+		changed = true
+	}
+	if changed {
+		a.notifyChangedLocked()
+	}
 }
 
 // Deprecated implements AddressEndpoint.
@@ -720,6 +877,66 @@ func (a *addressState) Deprecated() bool {
 	return a.mu.deprecated
 }
 
+// SetLifetimes implements AddressEndpoint.
+func (a *addressState) SetLifetimes(lifetimes AddressLifetimes) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	var changed bool
+	if a.mu.deprecated != lifetimes.Deprecated {
+		a.mu.deprecated = lifetimes.Deprecated
+		changed = true
+	}
+
+	var preferredUntil tcpip.MonotonicTime
+	if !lifetimes.Deprecated {
+		if lifetimes.PreferredUntil == (tcpip.MonotonicTime{}) {
+			preferredUntil = tcpip.MonotonicTimeInfinite()
+		} else {
+			preferredUntil = lifetimes.PreferredUntil
+		}
+	}
+	if a.mu.preferredUntil != preferredUntil {
+		changed = true
+		a.mu.preferredUntil = preferredUntil
+	}
+
+	validUntil := lifetimes.ValidUntil
+	if validUntil == (tcpip.MonotonicTime{}) {
+		validUntil = tcpip.MonotonicTimeInfinite()
+	}
+	if a.mu.validUntil != validUntil {
+		a.mu.validUntil = validUntil
+		changed = true
+	}
+
+	if changed {
+		a.notifyChangedLocked()
+	}
+}
+
+// Lifetimes implements AddressEndpoint.
+func (a *addressState) Lifetimes() AddressLifetimes {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return AddressLifetimes{
+		Deprecated:     a.mu.deprecated,
+		PreferredUntil: a.mu.preferredUntil,
+		ValidUntil:     a.mu.validUntil,
+	}
+}
+
+// Temporary implements AddressEndpoint.
 func (a *addressState) Temporary() bool {
 	return a.temporary
+}
+
+// RegisterDispatcher implements AddressEndpoint.
+func (a *addressState) RegisterDispatcher(disp AddressDispatcher) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if disp != nil {
+		a.mu.disp = disp
+		a.notifyChangedLocked()
+	}
 }

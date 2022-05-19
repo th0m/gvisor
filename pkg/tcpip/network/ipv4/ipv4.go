@@ -142,7 +142,7 @@ func (p *protocol) NewEndpoint(nic stack.NetworkInterface, dispatcher stack.Tran
 		protocol:   p,
 	}
 	e.mu.Lock()
-	e.addressableEndpointState.Init(e)
+	e.addressableEndpointState.Init(e, stack.AddressableEndpointStateOptions{HiddenWhileDisabled: false})
 	e.igmp.init(e)
 	e.mu.Unlock()
 
@@ -276,6 +276,17 @@ func (e *endpoint) enableLocked() tcpip.Error {
 		return nil
 	}
 
+	e.addressableEndpointState.ForEachEndpoint(func(addressEndpoint stack.AddressEndpoint) bool {
+		switch kind := addressEndpoint.GetKind(); kind {
+		case stack.PermanentDisabled:
+			addressEndpoint.SetKind(stack.Permanent)
+		case stack.Temporary:
+		default:
+			panic(fmt.Sprintf("address %s kind not disabled or temporary: %d", addressEndpoint.AddressWithPrefix(), kind))
+		}
+		return true
+	})
+
 	// Create an endpoint to receive broadcast packets on this interface.
 	ep, err := e.addressableEndpointState.AddAndAcquirePermanentAddress(ipv4BroadcastAddr, stack.AddressProperties{PEB: stack.NeverPrimaryEndpoint})
 	if err != nil {
@@ -347,6 +358,21 @@ func (e *endpoint) disableLocked() {
 	// Leave groups from the perspective of IGMP so that routers know that
 	// we are no longer interested in the group.
 	e.igmp.softLeaveAll()
+
+	e.addressableEndpointState.ForEachEndpoint(func(addressEndpoint stack.AddressEndpoint) bool {
+		switch kind := addressEndpoint.GetKind(); kind {
+		case stack.PermanentDisabled:
+			panic(fmt.Sprintf("address %s already disabled when disabling NIC", addressEndpoint.AddressWithPrefix()))
+		case stack.PermanentTentative:
+			panic(fmt.Sprintf("IPv4 address %s must not be tentative", addressEndpoint.AddressWithPrefix()))
+		case stack.Permanent:
+			addressEndpoint.SetKind(stack.PermanentDisabled)
+		case stack.Temporary:
+		default:
+			panic(fmt.Sprintf("address %s has unknown kind %d", addressEndpoint.AddressWithPrefix(), kind))
+		}
+		return true
+	})
 
 	// The address may have already been removed.
 	switch err := e.addressableEndpointState.RemovePermanentAddress(ipv4BroadcastAddr.Address); err.(type) {
@@ -1053,7 +1079,11 @@ func (e *endpoint) AddAndAcquirePermanentAddress(addr tcpip.AddressWithPrefix, p
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	ep, err := e.addressableEndpointState.AddAndAcquirePermanentAddress(addr, properties)
+	kind := stack.PermanentDisabled
+	if e.Enabled() {
+		kind = stack.Permanent
+	}
+	ep, err := e.addressableEndpointState.AddAndAcquireAddress(addr, properties, kind)
 	if err == nil {
 		e.sendQueuedReports()
 	}
@@ -1080,6 +1110,13 @@ func (e *endpoint) SetDeprecated(addr tcpip.Address, deprecated bool) tcpip.Erro
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.addressableEndpointState.SetDeprecated(addr, deprecated)
+}
+
+// SetLifetimes implements stack.AddressableEndpoint.
+func (e *endpoint) SetLifetimes(addr tcpip.Address, lifetimes stack.AddressLifetimes) tcpip.Error {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.addressableEndpointState.SetLifetimes(addr, lifetimes)
 }
 
 // MainAddress implements stack.AddressableEndpoint.
