@@ -103,7 +103,11 @@ def _syscall_test(
     if platform == "native":
         tags.append("nogotsan")
 
-    container = "container" in tags
+    # Containerize in the following cases:
+    #  - "container" is explicitly specified as a tag
+    #  - Running tests natively
+    #  - Running tests with host networking
+    container = "container" in tags or platform == "native" or network == "host"
 
     runner_args = [
         # Arguments are passed directly to runner binary.
