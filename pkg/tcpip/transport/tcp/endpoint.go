@@ -380,21 +380,12 @@ type endpoint struct {
 	lastErrorMu sync.Mutex `state:"nosave"`
 	lastError   tcpip.Error
 
-	// rcvReadMu synchronizes calls to Read.
-	//
-	// mu and rcvQueueMu are temporarily released during data copying. rcvReadMu
-	// must be held during each read to ensure atomicity, so that multiple reads
-	// do not interleave.
-	//
-	// rcvReadMu should be held before holding mu.
-	rcvReadMu sync.Mutex `state:"nosave"`
-
 	// rcvQueueInfo holds the implementation of the endpoint's receive buffer.
-	// The data within rcvQueueInfo should only be accessed while rcvReadMu, mu,
-	// and rcvQueueMu are held, in that stated order. While processing the segment
-	// range, you can determine a range and then temporarily release mu and
-	// rcvQueueMu, which allows new segments to be appended to the queue while
-	// processing.
+	// The data within rcvQueueInfo should only be accessed while mu and
+	// rcvQueueMu are held, in that stated order (except in Readiness()).
+	// While processing the segment range, you can determine a range and then
+	// temporarily release mu and rcvQueueMu, which allows new segments to be
+	// appended to the queue while processing.
 	rcvQueueInfo rcvQueueInfo
 
 	// rcvMemUsed tracks the total amount of memory in use by received segments
@@ -1356,45 +1347,68 @@ func (e *endpoint) UpdateLastError(err tcpip.Error) {
 
 // Read implements tcpip.Endpoint.Read.
 func (e *endpoint) Read(dst io.Writer, opts tcpip.ReadOptions) (tcpip.ReadResult, tcpip.Error) {
-	e.rcvReadMu.Lock()
-	defer e.rcvReadMu.Unlock()
+	e.LockUser()
+	defer e.UnlockUser()
 
-	// N.B. Here we get a range of segments to be processed. It is safe to not
-	// hold rcvQueueMu when processing, since we hold rcvReadMu to ensure only we
-	// can remove segments from the list through commitRead().
-	first, last, serr := e.startRead()
-	if serr != nil {
-		if _, ok := serr.(*tcpip.ErrClosedForReceive); ok {
+	e.rcvQueueInfo.rcvQueueMu.Lock()
+	if err := e.checkReadLocked(); err != nil {
+		if _, ok := err.(*tcpip.ErrClosedForReceive); ok {
 			e.stats.ReadErrors.ReadClosed.Increment()
 		}
-		return tcpip.ReadResult{}, serr
+		e.rcvQueueInfo.rcvQueueMu.Unlock()
+		return tcpip.ReadResult{}, err
 	}
+	e.rcvQueueInfo.rcvQueueMu.Unlock()
 
 	var err error
 	done := 0
-	s := first
+	// N.B. Here we get the first segment to be processed. It is safe to not
+	// hold rcvQueueMu when processing, since we hold e.mu to ensure we only
+	// remove segments from the list through Read() and that new segments
+	// cannot be appended.
+	s := e.rcvQueueInfo.rcvQueue.Front()
 	for s != nil {
 		var n int
 		n, err = s.ReadTo(dst, opts.Peek)
 		// Book keeping first then error handling.
-
 		done += n
 
 		if opts.Peek {
-			// For peek, we use the (first, last) range of segment returned from
-			// startRead. We don't consume the receive buffer, so commitRead should
-			// not be called.
-			//
-			// N.B. It is important to use `last` to determine the last segment, since
-			// appending can happen while we process, and will lead to data race.
-			if s == last {
-				break
-			}
 			s = s.Next()
 		} else {
-			// N.B. commitRead() conveniently returns the next segment to read, after
-			// removing the data/segment that is read.
-			s = e.commitRead(n)
+			sendNonZeroWindowUpdate := false
+			memDelta := 0
+			for {
+				seg := e.rcvQueueInfo.rcvQueue.Front()
+				if seg == nil || seg.payloadSize() != 0 {
+					break
+				}
+				e.rcvQueueInfo.rcvQueue.Remove(seg)
+				// Memory is only considered released when the whole segment has been
+				// read.
+				memDelta += seg.segMemSize()
+				seg.DecRef()
+			}
+			// We must lock around modification of RcvBufUsed because it is accessed
+			// without e.mu in Readiness().
+			e.rcvQueueInfo.rcvQueueMu.Lock()
+			e.rcvQueueInfo.RcvBufUsed -= n
+			s = e.rcvQueueInfo.rcvQueue.Front()
+
+			if memDelta > 0 {
+				// If the window was small before this read and if the read freed up
+				// enough buffer space, to either fit an aMSS or half a receive buffer
+				// (whichever smaller), then notify the protocol goroutine to send a
+				// window update.
+				if crossed, above := e.windowCrossedACKThresholdLocked(memDelta, int(e.ops.GetReceiveBufferSize())); crossed && above {
+					sendNonZeroWindowUpdate = true
+				}
+			}
+			e.rcvQueueInfo.rcvQueueMu.Unlock()
+
+			if e.EndpointState().connected() && sendNonZeroWindowUpdate {
+				e.rcv.nonZeroWindow() // +checklocksforce:e.rcv.ep.mu
+			}
 		}
 
 		if err != nil {
@@ -1412,101 +1426,43 @@ func (e *endpoint) Read(dst io.Writer, opts tcpip.ReadOptions) (tcpip.ReadResult
 	}, nil
 }
 
-// startRead checks that endpoint is in a readable state, and return the
-// inclusive range of segments that can be read.
+// checkRead checks that endpoint is in a readable state.
 //
-// +checklocks:e.rcvReadMu
-func (e *endpoint) startRead() (first, last *segment, err tcpip.Error) {
-	e.LockUser()
-	defer e.UnlockUser()
-
+// +checklocks:e.mu
+// +checklocks:e.rcvQueueInfo.rcvQueueMu
+func (e *endpoint) checkReadLocked() tcpip.Error {
 	// When in SYN-SENT state, let the caller block on the receive.
 	// An application can initiate a non-blocking connect and then block
 	// on a receive. It can expect to read any data after the handshake
 	// is complete. RFC793, section 3.9, p58.
 	if e.EndpointState() == StateSynSent {
-		return nil, nil, &tcpip.ErrWouldBlock{}
+		return &tcpip.ErrWouldBlock{}
 	}
 
 	// The endpoint can be read if it's connected, or if it's already closed
 	// but has some pending unread data. Also note that a RST being received
 	// would cause the state to become StateError so we should allow the
 	// reads to proceed before returning a ECONNRESET.
-	e.rcvQueueInfo.rcvQueueMu.Lock()
-	defer e.rcvQueueInfo.rcvQueueMu.Unlock()
-
 	bufUsed := e.rcvQueueInfo.RcvBufUsed
 	if s := e.EndpointState(); !s.connected() && s != StateClose && bufUsed == 0 {
 		if s == StateError {
 			if err := e.hardErrorLocked(); err != nil {
-				return nil, nil, err
+				return err
 			}
-			return nil, nil, &tcpip.ErrClosedForReceive{}
+			return &tcpip.ErrClosedForReceive{}
 		}
 		e.stats.ReadErrors.NotConnected.Increment()
-		return nil, nil, &tcpip.ErrNotConnected{}
+		return &tcpip.ErrNotConnected{}
 	}
 
 	if e.rcvQueueInfo.RcvBufUsed == 0 {
 		if e.rcvQueueInfo.RcvClosed || !e.EndpointState().connected() {
-			return nil, nil, &tcpip.ErrClosedForReceive{}
+			return &tcpip.ErrClosedForReceive{}
 		}
-		return nil, nil, &tcpip.ErrWouldBlock{}
+		return &tcpip.ErrWouldBlock{}
 	}
 
-	return e.rcvQueueInfo.rcvQueue.Front(), e.rcvQueueInfo.rcvQueue.Back(), nil
-}
-
-// commitRead commits a read of done bytes and returns the next non-empty
-// segment to read. Data read from the segment must have also been removed from
-// the segment in order for this method to work correctly.
-//
-// It is performance critical to call commitRead frequently when servicing a big
-// Read request, so TCP can make progress timely. Right now, it is designed to
-// do this per segment read, hence this method conveniently returns the next
-// segment to read while holding the lock.
-//
-// +checklocks:e.rcvReadMu
-func (e *endpoint) commitRead(done int) *segment {
-	e.LockUser()
-	defer e.UnlockUser()
-
-	sendNonZeroWindowUpdate := false
-	e.rcvQueueInfo.rcvQueueMu.Lock()
-	memDelta := 0
-	s := e.rcvQueueInfo.rcvQueue.Front()
-	for s != nil && s.payloadSize() == 0 {
-		e.rcvQueueInfo.rcvQueue.Remove(s)
-		// Memory is only considered released when the whole segment has been
-		// read.
-		memDelta += s.segMemSize()
-		s.DecRef()
-		s = e.rcvQueueInfo.rcvQueue.Front()
-	}
-	// Concurrent calls to Close() and Read() could cause RcvBufUsed to be
-	// negative because Read() unlocks between startRead() and commitRead(). In
-	// this case the read is allowed, but we refrain from subtracting from
-	// RcvBufUsed since it should already be zero.
-	if e.rcvQueueInfo.RcvBufUsed != 0 {
-		e.rcvQueueInfo.RcvBufUsed -= done
-	}
-
-	if memDelta > 0 {
-		// If the window was small before this read and if the read freed up
-		// enough buffer space, to either fit an aMSS or half a receive buffer
-		// (whichever smaller), then notify the protocol goroutine to send a
-		// window update.
-		if crossed, above := e.windowCrossedACKThresholdLocked(memDelta, int(e.ops.GetReceiveBufferSize())); crossed && above {
-			sendNonZeroWindowUpdate = true
-		}
-	}
-	nextSeg := e.rcvQueueInfo.rcvQueue.Front()
-	e.rcvQueueInfo.rcvQueueMu.Unlock()
-
-	if e.EndpointState().connected() && sendNonZeroWindowUpdate {
-		e.rcv.nonZeroWindow() // +checklocksforce:e.rcv.ep.mu
-	}
-	return nextSeg
+	return nil
 }
 
 // isEndpointWritableLocked checks if a given endpoint is writable
