@@ -35,12 +35,20 @@ type EndpointWriter struct {
 
 	// To is the endpoint to send to. May be nil.
 	To transport.BoundEndpoint
+
+	// Notify is the receiver.SendNotify notification callback that is
+	// returned from Endpoint.SendMsg. We can't call this callback
+	// ourselves inside SendMesg because that can be called with
+	// mm.activeMu held (via CopyOut). Instead, Notify must be called after
+	// CopyOut completes.
+	Notify func()
 }
 
 // WriteFromBlocks implements safemem.Writer.WriteFromBlocks.
 func (w *EndpointWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, error) {
 	return safemem.FromVecWriterFunc{func(bufs [][]byte) (int64, error) {
-		n, err := w.Endpoint.SendMsg(w.Ctx, bufs, w.Control, w.To)
+		n, notify, err := w.Endpoint.SendMsg(w.Ctx, bufs, w.Control, w.To)
+		w.Notify = notify
 		if err != nil {
 			return int64(n), err.ToError()
 		}
@@ -81,15 +89,21 @@ type EndpointReader struct {
 	// ControlTrunc indicates that SCM_RIGHTS FDs were discarded based on
 	// the value of NumRights.
 	ControlTrunc bool
+
+	// Notify is the ConnectedEndpoint.SendNotify callback that should be
+	// called after CopyIn completes. See comment above
+	// EndpointWriter.Notfy.
+	Notify func()
 }
 
 // Truncate calls RecvMsg on the endpoint without writing to a destination.
 func (r *EndpointReader) Truncate() error {
 	// Ignore bytes read since it will always be zero.
-	_, ms, c, ct, err := r.Endpoint.RecvMsg(r.Ctx, [][]byte{}, r.Creds, r.NumRights, r.Peek, r.From)
+	_, ms, c, ct, notify, err := r.Endpoint.RecvMsg(r.Ctx, [][]byte{}, r.Creds, r.NumRights, r.Peek, r.From)
 	r.Control = c
 	r.ControlTrunc = ct
 	r.MsgSize = ms
+	r.Notify = notify
 	if err != nil {
 		return err.ToError()
 	}
@@ -99,10 +113,11 @@ func (r *EndpointReader) Truncate() error {
 // ReadToBlocks implements safemem.Reader.ReadToBlocks.
 func (r *EndpointReader) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 	return safemem.FromVecReaderFunc{func(bufs [][]byte) (int64, error) {
-		n, ms, c, ct, err := r.Endpoint.RecvMsg(r.Ctx, bufs, r.Creds, r.NumRights, r.Peek, r.From)
+		n, ms, c, ct, notify, err := r.Endpoint.RecvMsg(r.Ctx, bufs, r.Creds, r.NumRights, r.Peek, r.From)
 		r.Control = c
 		r.ControlTrunc = ct
 		r.MsgSize = ms
+		r.Notify = notify
 		if err != nil {
 			return int64(n), err.ToError()
 		}

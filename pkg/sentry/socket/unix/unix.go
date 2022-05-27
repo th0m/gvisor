@@ -460,16 +460,25 @@ func (s *SocketOperations) Write(ctx context.Context, _ *fs.File, src usermem.IO
 	ctrl := control.New(t, s.ep, nil)
 
 	if src.NumBytes() == 0 {
-		nInt, err := s.ep.SendMsg(ctx, [][]byte{}, ctrl, nil)
+		nInt, notify, err := s.ep.SendMsg(ctx, [][]byte{}, ctrl, nil)
+		if notify != nil {
+			notify()
+		}
 		return int64(nInt), err.ToError()
 	}
 
-	return src.CopyInTo(ctx, &EndpointWriter{
+	w := &EndpointWriter{
 		Ctx:      ctx,
 		Endpoint: s.ep,
 		Control:  ctrl,
 		To:       nil,
-	})
+	}
+
+	n, err := src.CopyInTo(ctx, w)
+	if w.Notify != nil {
+		w.Notify()
+	}
+	return n, err
 }
 
 // SendMsg implements the linux syscall sendmsg(2) for unix sockets backed by
@@ -596,6 +605,9 @@ func (s *SocketOperations) Read(ctx context.Context, _ *fs.File, dst usermem.IOS
 		From:      nil,
 	}
 	n, err := dst.CopyOutFrom(ctx, r)
+	if r.Notify != nil {
+		r.Notify()
+	}
 	// Drop control messages.
 	r.Control.Release(ctx)
 	return n, err
