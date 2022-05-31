@@ -106,7 +106,7 @@ func main() {
 	}
 
 	if err := seccomp.Install(syscalls, nil); err != nil {
-		fmt.Printf("Failed to install seccomp: %v", err)
+		fmt.Printf("Failed to install seccomp: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Printf("Filters installed\n")
